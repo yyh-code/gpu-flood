@@ -1,121 +1,212 @@
-
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-
 #include <stdio.h>
+#include <malloc.h>
+#include <windows.h>
+#include <math.h>
+#include <stdlib.h>
+#include "../common/book.h"
+#include "cuda.h"
+#include "../common/cpu_bitmap.h"
+#include <iostream>
+#include <time.h>
+int M;
+int N;
+double dx, dy;
+double xllcorner;
+double yllcorner;
+int nodata;
+int ny, nx;
+char ncols[15];
+char nrows[15];
+char xllcorner_label[15];
+char yllcorner_label[15];
+char cellsize[15];
+char NODATA_value[15];
+int *z;
+int *infa;
+int *fa_pre;
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
-
-__global__ void addKernel(int *c, const int *a, const int *b)
+void gridread()    /*读取流向文件*/
 {
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+	int i, j;
+	FILE *fp;
+	char infile[10];
+	printf("输入流向文件名：");
+	scanf("%s", infile);
+	fp = fopen(infile, "r");
+	if (fp == NULL)
+	{
+		printf("cannot open file\n");
+		return;
+	}
+	fscanf(fp, "%s %d", &ncols, &M);
+	fscanf(fp, "%s %d", &nrows, &N);
+	fscanf(fp, "%s %lf", &xllcorner_label, &xllcorner);
+	fscanf(fp, "%s %lf", &yllcorner_label, &yllcorner);
+	fscanf(fp, "%s %lf", &cellsize, &dx);
+	fscanf(fp, "%s %d", &NODATA_value, &nodata);
+	dy = dx;
+	z = (int*)calloc(N*M, sizeof(int));
+	infa = (int*)calloc(N*M, sizeof(int));
+	fa_pre = (int*)calloc(N*M, sizeof(int));
+	for (i = 0; i<N; i++)
+	{
+		for (j = 0; j<M; j++)
+		{
+			fscanf(fp, "%d ", &z[i*M + j]);
+			infa[i*M + j] = 1;
+			fa_pre[i*M + j] = 0;
+		}
+		fscanf(fp, "\n");
+	}
+	fclose(fp);
+}
+__global__ void flood_cal(int *fd, int *fa, int *fa_pre, int rows, int cols, int *count, int i, int *dev_countx) {
+	int icol = blockIdx.x*blockDim.x + threadIdx.x;
+	int irow = blockIdx.y*blockDim.y + threadIdx.y;
+	if (irow >= rows || icol >= cols)
+		return;
+	int self = irow * cols + icol;
+	int nie, nise, nis, nisw, niw, ninw, nin, nine;
+	int count_self = 0, fa_tra1 = 0, fa_pre1 = 0;
+	nie = self + 1;
+	nise = self + cols + 1;
+	nis = self + cols;
+	nisw = self + cols - 1;
+	niw = self - 1;
+	ninw = self - cols - 1;
+	nin = self - cols;
+	nine = self - cols + 1;
+	count_self = count[self];
+	__syncthreads();
+	if (count_self == i) {
+		fa_tra1 = fa[self];
+		fa_pre1 = fa_pre[self];
+		if (icol <cols - 1 && fd[self] == 1) {
+			atomicAdd(&fa[nie], fa_tra1 - fa_pre1);
+			count[nie] = count_self + 1;
+		}
+		if (irow<rows - 1 && icol<cols - 1 && fd[self] == 2)
+		{
+			atomicAdd(&fa[nise], fa_tra1 - fa_pre1);
+			count[nise] = count_self + 1;
+		}
+		if (irow<rows - 1 && fd[self] == 4) {
+			atomicAdd(&fa[nis], fa_tra1 - fa_pre1);
+			count[nis] = count_self + 1;
+		}
+		if (irow<rows - 1 && icol>0 && fd[self] == 8) {
+			atomicAdd(&fa[nisw], fa_tra1 - fa_pre1);
+			count[nisw] = count_self + 1;
+		}
+		if (icol>0 && fd[self] == 16) {
+			atomicAdd(&fa[niw], fa_tra1 - fa_pre1);
+			count[niw] = count_self + 1;
+		}
+		if (irow >0 && icol >0 && fd[self] == 32) {
+			atomicAdd(&fa[ninw], fa_tra1 - fa_pre1);
+			count[ninw] = count_self + 1;
+		}
+		if (irow>0 && fd[self] == 64) {
+			atomicAdd(&fa[nin], fa_tra1 - fa_pre1);
+			count[nin] = count_self + 1;
+		}
+		if (irow >0 && icol <cols - 1 && fd[self] == 128) {
+			atomicAdd(&fa[nine], fa_tra1 - fa_pre1);
+			count[nine] = count_self + 1;
+		}
+		__syncthreads();
+		fa_pre[self] = fa_tra1;
+		atomicAdd(dev_countx, 1);
+	}
+	fa_pre1 = 0, fa_tra1 = 0, count_self = 0;
 }
 
-int main()
-{
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
 
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
+int main() {
 
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
+	clock_t start_time = clock();
+	gridread();
+	printf("In process\n");
+	cudaEvent_t  start, stop;
+	HANDLE_ERROR(cudaEventCreate(&start));
+	HANDLE_ERROR(cudaEventCreate(&stop));
+	HANDLE_ERROR(cudaEventRecord(start, 0));
+	int fulsize = N*M;
+	int *dev_fa, *outfa, *dev_z, *dev_fa_pre;
+	int BLOCKCOLS = 16;
+	int BLOCKROWS = 16;
+	int gridCols = (M + BLOCKCOLS - 1) / BLOCKCOLS;
+	int gridRows = (N + BLOCKROWS - 1) / BLOCKROWS;
+	dim3 dimgrid(gridCols, gridRows);
+	dim3 dimblock(BLOCKCOLS, BLOCKROWS);
+	int *count, *count_pre, *count1;
+	outfa = (int*)malloc(fulsize * sizeof(int));
+	count1 = (int*)malloc(fulsize * sizeof(int));
+	int count_x, *dev_countx;
+	HANDLE_ERROR(cudaMalloc((void**)&dev_fa, fulsize * sizeof(int)));
+	HANDLE_ERROR(cudaMalloc((void**)&dev_fa_pre, fulsize * sizeof(int)));
+	HANDLE_ERROR(cudaMalloc((void**)&dev_z, fulsize * sizeof(int)));
+	HANDLE_ERROR(cudaMalloc((void**)&count, fulsize * sizeof(int)));
+	HANDLE_ERROR(cudaMalloc((void**)&dev_countx, sizeof(int)));
+	HANDLE_ERROR(cudaMemcpy(dev_fa, infa, fulsize * sizeof(int), cudaMemcpyHostToDevice));//传输初始值到设备数组
+	HANDLE_ERROR(cudaMemcpy(dev_fa_pre, fa_pre, fulsize * sizeof(int), cudaMemcpyHostToDevice));
+	HANDLE_ERROR(cudaMemcpy(dev_z, z, fulsize * sizeof(int), cudaMemcpyHostToDevice));//传输流向数据到设备
+	for (int k = 0;; k++)
+	{
+		count_x = 0;
+		cudaMemcpy(dev_countx, &count_x, sizeof(int), cudaMemcpyHostToDevice);
+		flood_cal << <dimgrid, dimblock >> >(dev_z, dev_fa, dev_fa_pre, N, M, count, k, dev_countx);
+		cudaMemcpy(&count_x, dev_countx, sizeof(int), cudaMemcpyDeviceToHost);
+		if (count_x == 0)
+		{
+			printf("迭代次数：%d\n", k);
+			break;
+		}
+	}
+	HANDLE_ERROR(cudaMemcpy(outfa, dev_fa, fulsize * sizeof(int), cudaMemcpyDeviceToHost));
+	HANDLE_ERROR(cudaMemcpy(count1, count, N*M * sizeof(int), cudaMemcpyDeviceToHost));
+	HANDLE_ERROR(cudaEventRecord(stop, 0));
+	HANDLE_ERROR(cudaEventSynchronize(stop));
+	float elapsedTime;
+	HANDLE_ERROR(cudaEventElapsedTime(&elapsedTime, start, stop));
+	printf("Time to generate:    %3.2f ms\n", elapsedTime);
+	HANDLE_ERROR(cudaEventDestroy(start));
+	HANDLE_ERROR(cudaEventDestroy(stop));
+	//输出文件
+	FILE *outfile;
+	outfile = fopen("out_flood.txt", "w");
+	if (outfile == NULL)
+	{
+		printf("cannot open the file\n");
+	}
 
-    return 0;
-}
+	fprintf(outfile, "%s       %d\n", "ncols", M);
+	fprintf(outfile, "%s       %d\n", "nrows", N);
+	fprintf(outfile, "%s 	%.12lf\n", "xllcorner", xllcorner);
+	fprintf(outfile, "%s 	%.12lf\n", "yllcorner", yllcorner);
+	fprintf(outfile, "%s 	%.12lf\n", "cellsize", dx);
+	fprintf(outfile, "%s  	%d\n", "NODATA_value", nodata);
+	for (int i = 0; i<N; i++)
+	{
+		for (int j = 0; j<M; j++)
+		{
+			fprintf(outfile, "%d ", outfa[i*M + j]);
+		}
+		fprintf(outfile, "\n");
+	}
 
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
+	fclose(outfile);
+	printf("finished!\n");
+	clock_t end_time = clock();
+	float clockTime = static_cast<double>(end_time - start_time) / CLOCKS_PER_SEC * 1000;
+	//printf("Running time is:   %3.2f ms\n", clockTime);
+	cudaFree(infa);
+	cudaFree(fa_pre);
+	cudaFree(dev_z);
+	cudaFree(count);
+	free(outfa);
+	free(count1);
+	free(z);
+	free(infa);
 }
